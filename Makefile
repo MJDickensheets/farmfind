@@ -1,5 +1,7 @@
+server:
+	racket server.rkt
 lint:
-	black farmfind
+	black scripts
 test:
-	mypy farmfind
+	mypy scripts
 

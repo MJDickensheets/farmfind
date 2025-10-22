@@ -1,44 +1,22 @@
 from enum import Enum
+from functools import reduce
 from http.client import HTTPSConnection
-from json import loads
+from itertools import groupby
+from json import dumps, loads
 from os import remove
-from sqlite3 import connect
+from sqlite3 import Connection, ProgrammingError, connect
 from sys import exit
-from typing import Any
+from typing import Any, Callable, Dict, Iterator, List
 
-API_KEY = 'de13c14fa8937c82618fa846f90fd7cc8df4b02d'
+import fiona  # type: ignore
+
+with open("census-api.key") as keyfile:
+    API_KEY = keyfile.read().strip()
 URL_ROOT = "api.census.gov"
+SHAPEFILE_URL = "zip+https://www2.census.gov/geo/tiger/GENZ2024/shp/"
+SCHEMA_PATH = "schema.sql"
 DB_PATH = "lib/farmfind.db"
 MEDIAN_INCOME = "B19326_001E"
-
-SCHEMA = [
-    """\
-    create table states (
-        state_id int,
-        name text
-    );
-    """,
-    """\
-    create table counties (
-        county_id int,
-        state_id int,
-        name text
-    );
-    """,
-    """\
-    create table median_income_state (
-        state_id int,
-        income int
-    );
-    """,
-    """\
-    create table median_income_county (
-        state_id int,
-        county_id int,
-        income int
-    );
-    """,
-]
 
 
 class Dataset(Enum):
@@ -64,7 +42,6 @@ def mk_query(year: int, dataset: Dataset, **kwargs: Any) -> str:
     )
 
 
-
 def get(query: str) -> Any | None:
     conn = HTTPSConnection(URL_ROOT)
     conn.request("GET", query)
@@ -75,7 +52,7 @@ def get(query: str) -> Any | None:
     raise RuntimeError(f"GET {query} returned {resp.status}: {resp.reason}")
 
 
-def expand(data):
+def expand(data) -> Iterator[Dict[str, Any]]:
     header = None
     for item in data:
         if header is None:
@@ -84,28 +61,78 @@ def expand(data):
             yield dict(zip(header, item))
 
 
+def join_dicts(*dicts: Dict[str, Any], by: Callable[[Dict[str, Any]], Any]) -> List[Dict]:
+    return [
+        reduce(lambda x, y: x | y, grp) for _, grp in groupby(sorted(dicts, key=by), key=by)
+    ]
+
+
+def from_shapefile(url: str, **prop_aliases: str) -> List[Dict[str, Any]]:
+    with fiona.open(url) as recs:
+        return [
+            {
+                **{
+                    alias: dict(rec.properties)[prop]
+                    for prop, alias in prop_aliases.items()
+                },
+                "geometry": dumps(dict(rec.geometry)),
+            }
+            for rec in recs
+        ]
+
+
+def insertmany(conn: Connection, table: str, *records: Dict[str, Any]) -> None:
+    for rec in records:
+        try:
+            insert(conn, table, **rec)
+        except ProgrammingError:
+            print(f"skipped {rec}")
+
+
+def insert(conn: Connection, table: str, **kv: Any) -> None:
+    conn.execute(f"insert into {', '.join(kv)} values ({', '.join(f':{k}' for k in kv)})")
+
+
 if __name__ == "__main__":
     try:
         remove(DB_PATH)
-    except ValueError:
+    except FileNotFoundError:
         pass
-    with connect(DB_PATH) as conn:
-        for stmt in SCHEMA:
+    with open(SCHEMA_PATH) as schema, connect(DB_PATH) as conn:
+        for stmt in schema.read().split(";"):
             conn.execute(stmt)
-        conn.executemany(
-            "insert into states (name, state_id) values (:NAME, :state)",
-            expand(get(mk_query(2023, Dataset.GEOINFO, get="NAME", _for="state:*")))
+        insertmany(
+            conn,
+            "state",
+            *join_dicts(
+                *expand(
+                    get(mk_query(2023, Dataset.GEOINFO, get="NAME", _for="state:*"))
+                ),
+                *expand(
+                    get(mk_query(2024, Dataset.ACS, get=MEDIAN_INCOME, _for="state:*"))
+                ),
+                *from_shapefile(
+                    SHAPEFILE_URL + "cb_2024_us_state_5m.zip", STATEFP="state"
+                ),
+                by=lambda rec: int(rec["state"]),
+            ),
         )
-        conn.executemany(
-            "insert into counties (name, state_id, county_id) values (:NAME, :state, :county)",
-            expand(get(mk_query(2023, Dataset.GEOINFO, get="NAME", _for="county:*")))
-        )
-        conn.executemany(
-            f"insert into median_income_state (state_id, income) values (:state, :{MEDIAN_INCOME})",
-            expand(get(mk_query(2024, Dataset.ACS, get=MEDIAN_INCOME, _for="state:*"))),
-        )
-        conn.executemany(
-            f"insert into median_income_county (state_id, county_id, income) values (:state, :county, :{MEDIAN_INCOME})",
-            expand(get(mk_query(2024, Dataset.ACS, get=MEDIAN_INCOME, _for="county:*"))),
+        insertmany(
+            conn,
+            "county",
+            *join_dicts(
+                *expand(
+                    get(mk_query(2023, Dataset.GEOINFO, get="NAME", _for="county:*"))
+                ),
+                *expand(
+                    get(mk_query(2024, Dataset.ACS, get=MEDIAN_INCOME, _for="county:*"))
+                ),
+                *from_shapefile(
+                    SHAPEFILE_URL + "cb_2024_us_county_20m.zip",
+                    COUNTYFP="county",
+                    STATEFP="state",
+                ),
+                by=lambda rec: (int(rec["county"]), int(rec["state"])),
+            ),
         )
         conn.commit()
